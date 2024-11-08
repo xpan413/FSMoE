@@ -1,11 +1,13 @@
-import torch
 import argparse
+
+import torch
+import torch.nn.functional as F
 
 
 def main(tokens, model, hidden):
     # Initialize random tensors on CUDA
     matrix_a = torch.randn((tokens, model), device="cuda:0")
-    matrix_b = torch.randn((model, hidden), device="cuda:0")
+    matrix_b = torch.randn((hidden, model), device="cuda:0")
 
     # Constants
     MEMORY_SIZE = 4096 * 14336 * 16
@@ -17,7 +19,7 @@ def main(tokens, model, hidden):
 
     # Warm-up phase to stabilize CUDA performance
     for _ in range(20):
-        torch.matmul(matrix_a, matrix_b)
+        F.linear(matrix_a, matrix_b)
 
     # Create CUDA events for timing
     start_event = torch.cuda.Event(enable_timing=True)
@@ -31,7 +33,7 @@ def main(tokens, model, hidden):
 
     # Perform matrix multiplication for a set number of iterations
     for _ in range(NUM_ITERATIONS):
-        torch.matmul(matrix_a, matrix_b)
+        F.linear(matrix_a, matrix_b)
 
     # Record the end time
     end_event.record()
