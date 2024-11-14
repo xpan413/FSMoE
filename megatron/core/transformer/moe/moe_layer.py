@@ -173,6 +173,9 @@ class _HandcraftBackward(torch.autograd.Function):
         return ctx.moe._handcraft_backward(grad_output), None, None
 
 
+from math import lcm
+
+
 class MoELayer(BaseMoELayer):
     """FsMoE Layer**.
 
@@ -257,7 +260,11 @@ class MoELayer(BaseMoELayer):
     def do_order(self, batch: dict) -> None:
 
         batch["probs"], batch["indices"], _ = topk_softmax_with_capacity(
-            batch["logits"], self.topk, self.capacity_factor, True
+            batch["logits"],
+            self.topk,
+            self.capacity_factor,
+            True,
+            pad_to_pipeline=lcm(self.pipeline_degree, self.bp_pipeline_degree),
         )
         batch["iorder_data_shape"] = batch["data"].shape
         batch["data"] = batch["data"].index_select(dim=0, index=batch["indices"].view(-1))
@@ -361,26 +368,30 @@ class MoELayer(BaseMoELayer):
             )
         batch["event"].record()
 
-    def do_combine(self, batch: dict) -> None:
+    def do_combine(
+        self, batch: dict, is_reduce_scatter: bool = True, is_all_to_all: bool = True
+    ) -> None:
         r"""
         The collective communication to do_combine the data.
         """
-        with torch.cuda.stream(self.intra_stream):
-            batch["event"].wait()
-            if parallel_state.get_tensor_model_parallel_world_size() > 1:
-                torch.distributed._reduce_scatter_base(
-                    batch["combine_output"],
-                    batch["data"],
-                    group=parallel_state.get_tensor_model_parallel_group(),
+        if is_reduce_scatter:
+            with torch.cuda.stream(self.intra_stream):
+                batch["event"].wait()
+                if parallel_state.get_tensor_model_parallel_world_size() > 1:
+                    torch.distributed._reduce_scatter_base(
+                        batch["combine_output"],
+                        batch["data"],
+                        group=parallel_state.get_tensor_model_parallel_group(),
+                    )
+                    batch["data"] = batch["combine_output"]
+                batch["event"].record()
+        if is_all_to_all:
+            with torch.cuda.stream(self.inter_stream):
+                batch["event"].wait()
+                batch["data"] = tensor_parallel.all_to_all(
+                    parallel_state.get_expert_model_parallel_group(), batch["data"]
                 )
-                batch["data"] = batch["combine_output"]
-            batch["event"].record()
-        with torch.cuda.stream(self.inter_stream):
-            batch["event"].wait()
-            batch["data"] = tensor_parallel.all_to_all(
-                parallel_state.get_expert_model_parallel_group(), batch["data"]
-            )
-            batch["event"].record()
+                batch["event"].record()
 
     def do_iorder(self, batch: dict) -> None:
         batch["data"] = unpermute_with_padded_tokens(
@@ -449,7 +460,9 @@ class MoELayer(BaseMoELayer):
         for _batch in micro_batch:
             self.do_bp_experts(_batch)
             self.before_combine_hook(_batch)
-            self.do_combine(_batch)
+            self.do_combine(_batch, is_all_to_all=False)
+        for _batch in micro_batch:
+            self.do_combine(_batch, is_reduce_scatter=False)
             self.after_combine_hook(_batch)
 
         output_lst = []
@@ -496,6 +509,7 @@ class MoELayer(BaseMoELayer):
                 pipelined_data = torch.tensor_split(
                     batch["data"].view(*batch["indices"].shape, -1), self.pipeline_degree, 1
                 )
+                # print(pipelined_data[0].shape)
                 pipelined_tokens_per_expert = torch.full(
                     (self.num_local_experts,),
                     batch["indices"].shape[1] * self.tp_size * self.ep_size // self.pipeline_degree,
@@ -526,7 +540,9 @@ class MoELayer(BaseMoELayer):
                 for _batch in micro_batch:
                     self.do_experts(_batch)
                     self.before_combine_hook(_batch)
-                    self.do_combine(_batch)
+                    self.do_combine(_batch, is_all_to_all=False)
+                for _batch in micro_batch:
+                    self.do_combine(_batch, is_reduce_scatter=False)
                     self.after_combine_hook(_batch)
 
                 output_lst = []

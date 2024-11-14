@@ -87,7 +87,9 @@ def sinkhorn(cost: torch.Tensor, tol: float = 0.0001):
     return d1 * cost * d0.unsqueeze(1)
 
 
-def get_capacity(num_tokens: int, num_experts: int, capacity_factor: float, min_capacity=None):
+def get_capacity(
+    num_tokens: int, num_experts: int, capacity_factor: float, min_capacity=None, pad_to_pipeline=1
+):
     """
     Calculate the capacity of each expert.
 
@@ -103,6 +105,7 @@ def get_capacity(num_tokens: int, num_experts: int, capacity_factor: float, min_
     capacity = math.ceil((num_tokens / num_experts) * capacity_factor)
     if min_capacity is not None and capacity < min_capacity:
         capacity = min_capacity
+    capacity = (capacity + pad_to_pipeline - 1) // pad_to_pipeline * pad_to_pipeline
     return capacity
 
 
@@ -328,6 +331,7 @@ def topk_softmax_with_capacity(
     drop_policy: str = "probs",
     use_pre_softmax: bool = False,
     deterministic_mode: bool = False,
+    pad_to_pipeline: int = 1,
 ):
     """Apply capacity and padding to the top-k selection.
     Args:
@@ -375,7 +379,10 @@ def topk_softmax_with_capacity(
     else:
         # TopK with capacity
         expert_capacity = get_capacity(
-            num_tokens=num_tokens * topk, num_experts=num_experts, capacity_factor=capacity_factor
+            num_tokens=num_tokens * topk,
+            num_experts=num_experts,
+            capacity_factor=capacity_factor,
+            pad_to_pipeline=pad_to_pipeline,
         )
         # TopK selection, Maskout unused experts
         topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
